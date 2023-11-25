@@ -49,6 +49,9 @@ PATH_output  = Path(f"build/output/{VAR_bundlename}")
 PATH_content = PATH_output / "content"
 
 
+def file_digest(full_path: Path):
+    with open(full_path, "rb") as f:
+        return hashlib.sha256(f.read()).digest()
 
 
 
@@ -128,11 +131,7 @@ class FilePicker(object):
         prev_tuple = self.item_shas.get(full_path.name)
 
         # Compute digest of original file
-        s = hashlib.sha256()
-        with open(full_path, "rb") as f:
-            content = f.read()
-        s.update(content)
-        digest = s.digest()
+        digest = file_digest(full_path)
 
 
         if prev_tuple is None:
@@ -163,10 +162,7 @@ class FilePicker(object):
             if self.has_patch(target_path):
                 self.apply_patch(target_path)
                 self.pre_patch_shas.add(digest)
-                s = hashlib.sha256()
-                with open(target_path, "rb") as f:
-                    s.update(f.read())
-                digest = s.digest()
+                digest = file_digest(target_path)
 
             self.item_shas[full_path.name] = (digest, full_path)
 
