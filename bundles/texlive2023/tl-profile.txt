@@ -12,7 +12,7 @@ instopt_letter 1
 instopt_portable 0
 instopt_write18_restricted 0
 tlpdbopt_autobackup 1
-tlpdbopt_create_formats 1
+tlpdbopt_create_formats 0
 tlpdbopt_desktop_integration 0
 tlpdbopt_file_assocs 0
 tlpdbopt_install_docfiles 0
