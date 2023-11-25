@@ -18,6 +18,7 @@ from pathlib import Path
 import subprocess
 import re
 import shutil
+from collections import defaultdict
 
 
 # Bundle parameters
@@ -37,12 +38,12 @@ def get_var(varname):
 VAR_bundlename = get_var('bundle_name')
 
 
-
 # Input paths
 PATH_ignore  = PATH_bundle / "ignore"
 PATH_extra   = PATH_bundle / "include"
 PATH_install = Path(f"build/install/{VAR_bundlename}")
 PATH_texlive = PATH_install / "texmf-dist"
+PATH_kpsewhich = PATH_install / "bin/x86_64-linux/kpsewhich"
 
 # Output paths
 PATH_output  = Path(f"build/output/{VAR_bundlename}")
@@ -54,14 +55,17 @@ def file_digest(full_path: Path):
         return hashlib.sha256(f.read()).digest()
 
 
-
 class FilePicker(object):
     def __init__(self):
-        self.item_shas = {}
-        self.final_hexdigest = None
-
-        # Map of "filename": Path
-        self.index = {}
+        # Statistics for summary
+        self.extra_count = 0 # Extra files added
+        self.extra_conflict_count = 0 # Number of conflicting extra files (0, ideally)
+        self.texlive_count = 0 # Number of files from texlive
+        self.ignored_count = 0 # Number of texlive files ignored
+        self.replaced_count = 0 # Number of texlive files replaced with extra files
+        self.kpse_count = 0 # Number of texlive files found with kpsewhich
+        self.kpse_tex_count = 0 # Number of texlive files found with kpsewhich with tex filetype
+        self.omitted_count = 0 # Number of texlive files not found with kpsewhich and thus omitted
 
         # Keeps track of conflicting file names
         # { "basename": {
@@ -69,17 +73,7 @@ class FilePicker(object):
         # }}
         self.clashes = {}
 
-        # Number of files with conflicting file names
-        # that have the same content as the file we added to the bundle.
-        # These are not added to self.clashes.
-        self.identical_clashes = 0
-
-
-        # Hashes of files we've applied patches to
-        # (calculated before patching)
-        # This lets us detect conflicting patched files
-        # with identical contents.
-        self.pre_patch_shas = set()
+        self.output_paths = {}
 
         # Array of diff file paths in include dir.
         # Scanned at start of run, applied while running.
@@ -126,62 +120,81 @@ class FilePicker(object):
         return True
 
 
-    def add_file(self, full_path: Path):
-        # Have we seen this filename before?
-        prev_tuple = self.item_shas.get(full_path.name)
+    def find_with_kpse(self, file_name: str):
+        try:
+            p = subprocess.run([PATH_kpsewhich, "--engine=xetex", "--progname=xelatex", file_name], capture_output=True, check=True)
+            self.kpse_count += 1
+        except subprocess.CalledProcessError:
+            # e.g. ibycus4.map was autodeduced as map file, but is in fact a tex file
+            try:
+                p = subprocess.run([PATH_kpsewhich, "--engine=xetex", "--progname=xelatex", "--format=tex", file_name], capture_output=True, check=True)
+                self.kpse_tex_count += 1
+            except subprocess.CalledProcessError:
+                self.omitted_count += 1
+                raise FileNotFoundError
+        full_path = Path(p.stdout.decode('utf-8').rstrip())
+        return full_path.relative_to(Path.cwd()) # .relative_to(PATH_texlive)
 
-        # Compute digest of original file
-        digest = file_digest(full_path)
 
+    def get_file_paths(self):
+        # For each (base)name get the list of paths
+        name_paths = defaultdict(list)
+        for f in PATH_texlive.rglob("*"):
+            if not f.is_file():
+                continue
 
-        if prev_tuple is None:
-            # This is a new file, ok for now.
+            if not self.consider_file(f):
+                self.ignored_count += 1
+                continue
 
-            # Edge case: this is a duplicate of a file we've already patched.
-            # This hash won't show up in self.item_shas, since that dict
-            # only contains the post-patch hash.
-            if digest in self.pre_patch_shas:
-                self.identical_clashes += 1
-                return
+            name_paths[f.name].append(f)
 
-            target_path = PATH_content
-            if self.has_patch(full_path):
-                target_path /= "patched" / Path(full_path.name)
-            elif full_path.is_relative_to(PATH_texlive):
-                target_path /= "texlive" / full_path.relative_to(PATH_texlive)
-            elif full_path.is_relative_to(PATH_extra):
-                target_path /= "include" / full_path.relative_to(PATH_extra)
+        return dict(name_paths)
+
+    def resolve_paths(self, name_paths):
+        # For each name choose the path we will use
+        # Map of "filename": Path
+        index = {}
+
+        i = 0
+        for name, paths in name_paths.items():
+            if len(paths) == 1:
+                path = paths[0]
             else:
-                target_path /= "unknown" / Path(full_path.name)
+                self.clashes[name] = paths
+                try:
+                    path = self.find_with_kpse(name)
+                    if not self.consider_file(path):
+                        continue
+                except FileNotFoundError:
+                    continue
 
-            self.index[full_path.name] = target_path.relative_to(PATH_content)
-            target_path.parent.mkdir(parents = True, exist_ok=True)
-            shutil.copyfile(full_path, target_path)
+            index[name] = path
 
-            # Apply patches and compute new hash
-            if self.has_patch(target_path):
-                self.apply_patch(target_path)
-                self.pre_patch_shas.add(digest)
-                digest = file_digest(target_path)
+        return index
 
-            self.item_shas[full_path.name] = digest
-
-        # Don't check contents, conflicting identical files are still a conflict.
-        # we'll have to explicitly ignore one version.
+    def add_file(self, full_path: Path):
+        target_path = PATH_content
+        if self.has_patch(full_path):
+            target_path /= "patched" / Path(full_path.name)
+        elif full_path.is_relative_to(PATH_texlive):
+            target_path /= "texlive" / full_path.relative_to(PATH_texlive)
+            self.texlive_count += 1
+        elif full_path.is_relative_to(PATH_extra):
+            target_path /= "include" / full_path.relative_to(PATH_extra)
         else:
-            # We already have a file with this name and different contents
-            bydigest = self.clashes.setdefault(full_path.name, {})
+            target_path /= "unknown" / Path(full_path.name)
 
-            if not len(bydigest):
-                # If this is the first duplicate, don't forget that we've seen
-                # the file at least once before.
-                bydigest[prev_tuple[0]] = [prev_tuple[1]]
+        self.output_paths[full_path.name] = target_path.relative_to(PATH_content)
+        target_path.parent.mkdir(parents = True, exist_ok=True)
+        shutil.copyfile(full_path, target_path)
 
-            pathlist = bydigest.setdefault(digest, [])
-            pathlist.append(full_path)
+        # Apply patches and compute new hash
+        if self.has_patch(target_path):
+            self.apply_patch(target_path)
+            pass
 
-            if prev_tuple[0] == digest:
-                self.identical_clashes += 1
+        return file_digest(target_path)
 
 
     def has_patch(self, file):
@@ -205,15 +218,7 @@ class FilePicker(object):
 
         return True
 
-    def go(self):
-        # Statistics for summary
-        extra_count = 0 # Extra files added
-        extra_conflict_count = 0 # Number of conflicting extra files (0, ideally)
-        texlive_count = 0 # Number of files from texlive
-        ignored_count = 0 # Number of texlive files ignored
-        replaced_count = 0 # Number of texlive files replaced with extra files
-
-        # Add extra files
+    def add_extra_files(self, name_paths):
         extra_basenames = set()
         if PATH_extra.is_dir():
             for f in PATH_extra.rglob("*"):
@@ -228,50 +233,41 @@ class FilePicker(object):
                     continue
                 if f.name in extra_basenames:
                     print(f"Warning: included file {f.name} has conflicts, ignoring")
-                    extra_conflict_count += 1
+                    self.extra_conflict_count += 1
                     continue
-                self.add_file(f)
-                extra_count += 1
+
+                if len(name_paths.get(f.name, [])) > 0:
+                    self.replaced_count += 1
+
+                name_paths[f.name] = [f]
+                self.extra_count += 1
                 extra_basenames.add(f.name)
 
-        # Add the main tree.
-        for f in PATH_texlive.rglob("*"):
+    def go(self):
+        # Get map from name to all possible file paths
+        name_paths = self.get_file_paths()
 
-            # Update less often so we spend fewer cycles on string manipulation.
-            # mod 193 so every digit moves (modding by 100 is boring, we get static zeros)
-            if (texlive_count+extra_count) % 193 == 0:
-                s = f"Selecting files... ({texlive_count+extra_count})"
-                self.print_len = len(s)
-                print(s, end = "\r")
+        # Add our extra flies to name paths
+        self.add_extra_files(name_paths)
 
-            if not f.is_file():
-                continue
+        # Get map from name to source path
+        index = self.resolve_paths(name_paths)
 
-            if not self.consider_file(f):
-                ignored_count += 1
-                continue
-
-            # This should be done AFTER consider_file,
-            # since we want to increment the counter only if
-            # this file wasn't ignored.
-            if f.name in extra_basenames:
-                replaced_count += 1
-                continue
-
-            texlive_count += 1
-            self.add_file(f)
-
+        # Copy files and hash them, get map from name to hash
+        hashes = { name: self.add_file(path) for name, path in index.items()}
 
         print("Selecting files... Done! Summary is below.")
-        print(f"\textra file conflicts: {extra_conflict_count}")
-        print(f"\ttl files ignored:     {ignored_count}")
-        print(f"\ttl files replaced:    {replaced_count}")
+        print(f"\textra file conflicts: {self.extra_conflict_count}")
+        print(f"\ttl files ignored:     {self.ignored_count}")
+        print(f"\ttl files replaced:    {self.replaced_count}")
         print(f"\ttl filename clashes:  {len(self.clashes)}")
-        print(f"\ttl identical clashes: {self.identical_clashes}")
+        print(f"\tresolved with kpse:   {self.kpse_count}")
+        print(f"\tresolved with tex:    {self.kpse_tex_count}")
+        print(f"\tunresolved:           {self.omitted_count}")
         print(f"\tdiffs applied/found:  {self.patch_applied_count}/{len(self.diffs)}")
         print( "\t===============================")
-        print(f"\textra files added:    {extra_count}")
-        print(f"\ttotal files:          {texlive_count+extra_count}")
+        print(f"\textra files added:    {self.extra_count}")
+        print(f"\ttotal files:          {self.texlive_count+self.extra_count}")
         print("")
 
         if len(self.diffs) != self.patch_applied_count:
@@ -279,25 +275,25 @@ class FilePicker(object):
 
         # Compute content hash
         s = hashlib.sha256()
-        s.update(struct.pack(">I", len(self.item_shas)))
+        s.update(struct.pack(">I", len(hashes)))
         s.update(b"\0")
-        for name in sorted(self.item_shas.keys()):
+        for name, hash in sorted(hashes.items()):
             s.update(name.encode("utf8"))
             s.update(b"\0")
-            s.update(self.item_shas[name])
-        self.final_hexdigest = s.hexdigest()
+            s.update(hash)
+        final_hexdigest = s.hexdigest()
 
         # Write bundle metadata
         with (PATH_content / "SHA256SUM").open("w") as f:
-            f.write(self.final_hexdigest)
+            f.write(final_hexdigest)
         if (PATH_install / "TEXLIVE-SHA256SUM").is_file():
             shutil.copyfile(
                 PATH_install / "TEXLIVE-SHA256SUM",
                 PATH_content / "TEXLIVE-SHA256SUM"
             )
         with (PATH_content / "INDEX").open("w") as f:
-            for k, p in sorted(self.index.items(), key = lambda x: x[0]):
-                f.write(f"{k} {p}\n")
+            for name, output_path in sorted(self.output_paths.items()):
+                f.write(f"{name} {output_path}\n")
 
 
 
@@ -306,33 +302,32 @@ class FilePicker(object):
         # This is essentially a detailed version of SHA256SUM,
         # Good for detecting file differences between bundles
         with (PATH_output / "file-hashes").open("w") as f:
-            f.write(f"{len(self.item_shas)}\n")
-            for name in sorted(self.item_shas.keys()):
+            f.write(f"{len(hashes)}\n")
+            for name, hash in sorted(hashes.items()):
                 f.write(name)
                 f.write("\t")
-                f.write(self.item_shas[name].hex())
+                f.write(hash.hex())
                 f.write("\n")
 
 
         with (PATH_output / "listing").open("w") as f:
-            for base in sorted(self.item_shas.keys()):
-                f.write(base+"\n")
+            for name in sorted(index.keys()):
+                f.write(name)
+                f.write("\n")
 
         if len(self.clashes):
             print(f"Warning: {len(self.clashes)} file clashes were found.")
             print(f"Logging clash report to {PATH_output}/clash-report")
 
             with (PATH_output / "clash-report").open("w") as f:
-                for filename in sorted(self.clashes.keys()):
-                    f.write(f"{filename}:\n")
-                    bydigest = self.clashes[filename]
+                for name, paths in sorted(self.clashes.items()):
+                    f.write(f"{name}:\n")
 
-                    for digest in sorted(bydigest.keys()):
-                        f.write(f"\t{digest.hex()[:8]}:\n")
+                    for path in paths:
+                        f.write(f"    {path}\n")
 
-                        for path in sorted(bydigest[digest]):
-                            f.write(f"\t\t{path}\n")
-                    f.write("\n\n")
+                    chosen_path = index.get(name, "OMITTED")
+                    f.write(f" -> {chosen_path}\n\n")
 
 
 
