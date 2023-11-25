@@ -19,6 +19,7 @@
 .*\.mf
 .*\.pl
 .*\.ps
+/web2c/metafont/mf\.base
 # End "always ignore" section.
 
 
