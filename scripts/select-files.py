@@ -164,7 +164,7 @@ class FilePicker(object):
                 self.pre_patch_shas.add(digest)
                 digest = file_digest(target_path)
 
-            self.item_shas[full_path.name] = (digest, full_path)
+            self.item_shas[full_path.name] = digest
 
         # Don't check contents, conflicting identical files are still a conflict.
         # we'll have to explicitly ignore one version.
@@ -260,7 +260,7 @@ class FilePicker(object):
 
             texlive_count += 1
             self.add_file(f)
-                
+
 
         print("Selecting files... Done! Summary is below.")
         print(f"\textra file conflicts: {extra_conflict_count}")
@@ -284,7 +284,7 @@ class FilePicker(object):
         for name in sorted(self.item_shas.keys()):
             s.update(name.encode("utf8"))
             s.update(b"\0")
-            s.update(self.item_shas[name][0])
+            s.update(self.item_shas[name])
         self.final_hexdigest = s.hexdigest()
 
         # Write bundle metadata
@@ -310,7 +310,7 @@ class FilePicker(object):
             for name in sorted(self.item_shas.keys()):
                 f.write(name)
                 f.write("\t")
-                f.write(self.item_shas[name][0].hex())
+                f.write(self.item_shas[name].hex())
                 f.write("\n")
 
 
